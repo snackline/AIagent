@@ -2,7 +2,7 @@
 """
 通用数据结构定义
 """
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Any, Optional
 
 
@@ -24,6 +24,13 @@ class Finding:
         """转换为字典"""
         return asdict(self)
 
+    def get(self, key: str, default=None):
+        """兼容 dict.get 的访问方式"""
+        return getattr(self, key, default)
+
+
+
+
 
 @dataclass
 class FixResult:
@@ -36,10 +43,12 @@ class FixResult:
     method: str  # "rule" 或 "llm"
     success: bool
     error_message: str = ""
+    fixed_issues: List[Dict[str, Any]] = field(default_factory=list)  # ✅ 新增字段
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return asdict(self)
+
 
 
 @dataclass

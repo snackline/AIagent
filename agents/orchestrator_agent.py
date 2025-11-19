@@ -1,4 +1,3 @@
-# agents/orchestrator_agent.py（修复后的完整版本）
 """
 OrchestratorAgent - 多语言Bug修复系统的总协调器
 """
@@ -117,13 +116,11 @@ class OrchestratorAgent(BaseAgent):
 
                 start_time = time.time()
 
-                # ✅ 修复：合并数据
                 scan_input = {"files": files}
                 scan_perception = self.scanner.perceive(scan_input)
                 scan_decision = self.scanner.decide(scan_perception)
-
-                # ✅ 关键修复：将 files 数据合并到 decision 中
-                scan_decision.update(scan_perception)  # 包含 files
+                # 合并 files 等数据
+                scan_decision.update(scan_perception)
 
                 scan_results = self.scanner.execute(scan_decision)
 
@@ -146,8 +143,6 @@ class OrchestratorAgent(BaseAgent):
                 }
                 analyze_perception = self.analyzer.perceive(analyze_input)
                 analyze_decision = self.analyzer.decide(analyze_perception)
-
-                # ✅ 合并数据
                 analyze_decision.update(analyze_perception)
 
                 analysis = self.analyzer.execute(analyze_decision)
@@ -158,7 +153,11 @@ class OrchestratorAgent(BaseAgent):
                 self.log(f"\n⏱️ 分析耗时: {pipeline_results['execution_time']['analyze']:.2f}秒")
 
             # 3. 修复阶段
-            if "fix" in workflow and enable_agents.get("fixer") and pipeline_results["analysis"]:
+            # ✅ 不再用 truthy 判断拦截，而是只要 fixer 启用就运行；
+            #    analysis 可能是 None 或 {}，FixerAgent 内部有 DebugBench 兜底逻辑。
+            analysis_data = pipeline_results.get("analysis") or {}
+
+            if "fix" in workflow and enable_agents.get("fixer"):
                 self.log(f"\n{'=' * 80}")
                 self.log("🔧 阶段 3/4：代码修复")
                 self.log("=" * 80)
@@ -166,14 +165,12 @@ class OrchestratorAgent(BaseAgent):
                 start_time = time.time()
 
                 fix_input = {
-                    "analysis": pipeline_results["analysis"],
+                    "analysis": analysis_data,
                     "files": files,
                     "user_request": user_request
                 }
                 fix_perception = self.fixer.perceive(fix_input)
                 fix_decision = self.fixer.decide(fix_perception)
-
-                # ✅ 合并数据
                 fix_decision.update(fix_perception)
 
                 fix_results = self.fixer.execute(fix_decision)
@@ -199,8 +196,6 @@ class OrchestratorAgent(BaseAgent):
                 }
                 verify_perception = self.verifier.perceive(verify_input)
                 verify_decision = self.verifier.decide(verify_perception)
-
-                # ✅ 合并数据
                 verify_decision.update(verify_perception)
 
                 verification = self.verifier.execute(verify_decision)
@@ -238,32 +233,30 @@ class OrchestratorAgent(BaseAgent):
         self.log("")
         self.log(f"⏱️ 总耗时: {total_time:.2f}秒")
 
-        # ✅ 修复除零错误
         if total_time > 0:
             for stage, duration in exec_time.items():
                 percentage = (duration / total_time * 100)
                 self.log(f"   - {stage}: {duration:.2f}秒 ({percentage:.1f}%)")
         else:
-            # 如果总耗时为0，只显示耗时，不显示百分比
             for stage, duration in exec_time.items():
                 self.log(f"   - {stage}: {duration:.2f}秒")
 
         # 扫描结果
-        scan_results = results.get("scan_results", {})
-        scan_summary = scan_results.get("summary", {})
+        scan_results = results.get("scan_results", {}) or {}
+        scan_summary = scan_results.get("summary", {}) or {}
 
         self.log("")
         self.log("🔍 扫描结果:")
         self.log(f"   - 发现问题: {scan_summary.get('total_defects', 0)} 个")
 
-        by_severity = scan_summary.get("by_severity", {})
+        by_severity = scan_summary.get("by_severity", {}) or {}
         self.log(f"   - 高危: {by_severity.get('HIGH', 0)} 个")
         self.log(f"   - 中危: {by_severity.get('MEDIUM', 0)} 个")
         self.log(f"   - 低危: {by_severity.get('LOW', 0)} 个")
 
         # 修复结果
-        fix_results = results.get("fix_results", {})
-        fix_summary = fix_results.get("summary", {})
+        fix_results = results.get("fix_results", {}) or {}
+        fix_summary = fix_results.get("summary", {}) or {}
 
         self.log("")
         self.log("🔧 修复结果:")
@@ -272,19 +265,7 @@ class OrchestratorAgent(BaseAgent):
         self.log(f"   - 修复失败: {fix_summary.get('failed', 0)} 个")
         self.log(f"   - 总修复数: {fix_summary.get('total_fixes', 0)} 处")
 
-        # 验证结果
-        verification = results.get("verification", {})
-        verify_summary = verification.get("summary", {})
 
-        self.log("")
-        self.log("✅ 验证结果:")
-        self.log(f"   - 验证文件: {verify_summary.get('total_files', 0)} 个")
-        self.log(f"   - 编译成功: {verify_summary.get('compile_success', 0)} 个")
-        self.log(f"   - 编译失败: {verify_summary.get('compile_failed', 0)} 个")
-        self.log(f"   - 平均修复率: {verify_summary.get('avg_fix_rate', 0):.1f}%")
-
-
-# 便捷函数
 def run_multi_language_repair(files: List[Dict],
                               user_request: str = "",
                               test_cases: List[Dict] = None,
@@ -305,7 +286,9 @@ def run_multi_language_repair(files: List[Dict],
         "fixer": {
             "llm_client": llm_client,
             "use_rules": True,
-            "use_llm": llm_client is not None
+            "use_llm": llm_client is not None,
+            # 🔥 为 Java 启用“无 issue 也尝试 LLM 修复”的兜底策略
+            "force_llm_on_empty": {"java": True},
         }
     }
 
@@ -319,7 +302,7 @@ def run_multi_language_repair(files: List[Dict],
 
     perception = orchestrator.perceive(input_data)
     decision = orchestrator.decide(perception)
-    decision.update(perception)  # 合并数据
+    decision.update(perception)
     results = orchestrator.execute(decision)
 
     return results

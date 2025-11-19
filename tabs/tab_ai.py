@@ -8,6 +8,7 @@
 # - 其余逻辑不变（缺陷检测/自动应用补丁/验证/配置/提示词等）
 
 import re, json, time, requests, os, tempfile
+from datetime import datetime
 from typing import List, Dict, Any,Tuple
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, QSettings, Qt, QMimeData
 from PyQt5.QtWidgets import QMessageBox, QInputDialog, QFileDialog, QTextEdit, QLabel, QProgressBar, QApplication, QPushButton
@@ -21,6 +22,14 @@ try:
 except ImportError as e:
     OrchestratorAgent = None
     print(f"[WARN] 多Agent系统未安装：{e}")
+
+# 报告生成器（多Agent结果导出）
+try:
+    from analyzers.report_generator import ReportGenerator
+except ImportError as e:
+    ReportGenerator = None
+    print(f"[WARN] ReportGenerator 未安装：{e}")
+
 
 # 仅代码文件白名单（严格模式）
 CODE_FILE_EXTS = {'.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rs', '.php'}
@@ -45,6 +54,10 @@ class OllamaLLMAdapter:
         self.api_base = api_base.rstrip("/")
         self.model = model
 
+        # ====== 新增：远程 AI 配置（通过环境变量控制）======
+        self.use_remote_mode = os.getenv("USE_REMOTE_AI", "false").lower() == "true"
+        self.remote_api_url = os.getenv("REMOTE_AI_URL", "http://127.0.0.1:8000/ai/query")
+
         if "/api/generate" in self.api_base:
             self.api_base = self.api_base.replace("/api/generate", "/api/chat")
         elif "/api" not in self.api_base:
@@ -60,7 +73,7 @@ class OllamaLLMAdapter:
             "messages": messages,
             "stream": False,
             "options": {
-                "num_ctx": 4096,
+                "num_ctx": 40960,
                 "num_predict": max_tokens,
                 "temperature": temperature,
             }
@@ -365,12 +378,37 @@ class Worker(QThread):
 
     def run(self):
         try:
-            if self.config.get('api_key'):
+            # 检查是否启用了远程模式（通过 config 标志）
+            if self.config.get("use_remote", False):
+                self.call_remote_api()
+            elif self.config.get('api_key'):
                 self.call_openai_api()
             else:
                 self.call_ollama()
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+    def call_remote_api(self):
+        """调用远程 FastAPI 后端"""
+        remote_url = self.config.get("remote_url", "http://127.0.0.1:8000/ai/query")
+        user_prompt = ""
+        for msg in reversed(self.messages):
+            if msg["role"] == "user":
+                user_prompt = msg["content"]
+                break
+
+        try:
+            response = requests.post(
+                remote_url,
+                json={"prompt": user_prompt},
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            full_text = result.get("response", "")
+            self.response_received.emit(full_text, True)
+        except Exception as e:
+            self.error_occurred.emit(f"远程 API 调用失败: {str(e)}")
 
     def stop(self):
         self._is_running = False
@@ -413,7 +451,7 @@ class Worker(QThread):
         num_predict = int(self.config.get("num_predict", 2048))  # 默认2048
 
         options = {
-            "num_ctx": 4096,
+            "num_ctx": 40960,
             "num_predict": num_predict,
             "temperature": 0.2,
             "top_p": 0.9,
@@ -612,7 +650,7 @@ class EnhancedTabAI():
             traceback.print_exc()
 
     def _truncate_for_ctx(self, text: str, max_chars: int = 12000) -> str:
-        """为避免超出上下文（num_ctx=4096），对发送给模型的文本做一次保守字符级裁剪"""
+        """为避免超出上下文（num_ctx=40960），对发送给模型的文本做一次保守字符级裁剪"""
         if text and len(text) > max_chars:
             return text[:max_chars] + "\n\n[提示] 为满足上下文限制，已对上下文进行截断。"
         return text
@@ -1097,11 +1135,17 @@ class EnhancedTabAI():
         self.thinking_start = time.time()
         self.timer.start(100)
 
+        # ====== 新增：判断是否使用远程 AI 后端 ======
+        use_remote = getattr(self, 'use_remote_mode', False)
+        remote_url = getattr(self, 'remote_api_url', "http://127.0.0.1:8000/ai/query")
+
         self.config = {
             "name": self.ui.config_combo.currentText(),
             "api_base": self.ui.conf_api_base.text(),
             "api_key": self.ui.conf_api_key.text(),
-            "model": self.ui.conf_model.text()
+            "model": self.ui.conf_model.text(),
+            "use_remote": use_remote,          # ← 新增标志
+            "remote_url": remote_url           # ← 新增 URL
         }
 
         self.worker = Worker(self.config, self.messages.copy())
@@ -1664,7 +1708,7 @@ class EnhancedTabAI():
             self.configs[name] = {
                 "api_base": "http://localhost:11434/api/generate",
                 "api_key": "",
-                "model": "deepseek-r1:1.5b"
+                "model": "qwen3-coder:30b"
             }
             self.save_configs()
             self.load_configs()
@@ -1803,7 +1847,52 @@ class EnhancedTabAI():
                 else:
                     self.ui.output_area.append("ℹ️ 未配置LLM，将仅使用规则修复")
 
-                # ===== 步骤4：构建配置 =====
+                # ==== Added Debug Info ====
+                try:
+                    source_hint = ""
+                    if "localhost" in api_base or "127.0.0.1" in api_base:
+                        source_hint = "🌐 当前模型来源：远程服务器 autodl（通过SSH隧道）"
+                    elif "11434" in api_base or "ollama" in api_base.lower():
+                        source_hint = "💻 当前模型来源：本地 Ollama 实例"
+                    else:
+                        source_hint = "☁️ 当前模型来源：外部API或自定义地址"
+
+                    self.ui.output_area.append("\n" + "=" * 80)
+                    self.ui.output_area.append(source_hint)
+                    self.ui.output_area.append(f"🧠 使用模型：{model}")
+                    self.ui.output_area.append(f"🔗 API地址：{api_base}")
+                    self.ui.output_area.append("=" * 80 + "\n")
+
+                    # （可选）快速检测 Ollama 是否可连通
+                    import requests
+                    try:
+                        resp = requests.get(f"{api_base.replace('/api/generate','')}/api/tags", timeout=3)
+                        if resp.status_code == 200:
+                            self.ui.output_area.append("✅ Ollama 服务连接成功！")
+                        else:
+                            self.ui.output_area.append(f"⚠️ Ollama 服务响应异常：{resp.status_code}")
+                    except Exception as conn_err:
+                        self.ui.output_area.append(f"❌ 无法连接 Ollama：{conn_err}")
+
+                    print(f"[DEBUG] {source_hint} | 模型: {model} | API: {api_base}")
+                except Exception as e:
+                    print(f"[DEBUG] 调试信息输出失败: {e}")
+                # ==== End Debug Info ====
+
+                # ===== 步骤4：构建配置（增强版） =====
+                # 自动检测 llm_client 是否有效
+                use_llm_flag = bool(llm_client and hasattr(llm_client, "chat"))
+
+                # 打印调试信息
+                print("\n" + "=" * 80)
+                print("🔥 [DEBUG] 构建多Agent配置中 ...")
+                print(f"🔥 [DEBUG] llm_client 类型: {type(llm_client)}")
+                print(f"🔥 [DEBUG] llm_client 是否为 None: {llm_client is None}")
+                print(f"🔥 [DEBUG] llm_client 是否具备 chat 方法: {hasattr(llm_client, 'chat')}")
+                print(f"🔥 [DEBUG] use_llm_flag 自动检测结果: {use_llm_flag}")
+                print("=" * 80 + "\n")
+
+                # 主配置
                 config = {
                     "scanner": {
                         "enable_external": True,
@@ -1812,30 +1901,39 @@ class EnhancedTabAI():
                     },
                     "analyzer": {},
                     "fixer": {
-                        "llm_client": llm_client,  # ✅ 传递 LLM 客户端
+                        "llm_client": llm_client,
                         "use_rules": True,
-                        "use_llm": llm_client is not None  # ✅ 只有配置成功才启用
+                        # 🔥 强制启用智能修复模式（即便 llm_client 暂时不可用）
+                        "use_llm": True if use_llm_flag else True
                     },
                     "verifier": {
                         "timeout": 60
                     }
                 }
 
+                # 可视化提示信息
+                if llm_client:
+                    msg = "✅ 检测到 LLM 客户端实例，智能修复模式已启用。"
+                else:
+                    msg = "⚠️ 未检测到有效 LLM 客户端，但已强制开启 use_llm=True。"
+
+                print(msg)
+                self.ui.output_area.append(msg)
+
+                # 输出配置状态
                 self.ui.output_area.append("\n" + "=" * 80)
-                self.ui.output_area.append("⚙️ 系统配置")
+                self.ui.output_area.append("⚙️ 系统配置（经增强版检测）")
                 self.ui.output_area.append("=" * 80)
                 self.ui.output_area.append(
                     f"   外部工具扫描: {'启用' if config['scanner']['enable_external'] else '禁用'}")
                 self.ui.output_area.append(f"   动态检测: {'启用' if config['scanner']['enable_dynamic'] else '禁用'}")
                 self.ui.output_area.append(f"   规则修复: {'启用' if config['fixer']['use_rules'] else '禁用'}")
                 self.ui.output_area.append(f"   LLM修复: {'启用' if config['fixer']['use_llm'] else '禁用'}")
-
-                # 🔥 调试信息
-                print(f"\n🔥🔥🔥 [DEBUG] llm_client 类型: {type(llm_client)}")
-                print(f"🔥🔥🔥 [DEBUG] llm_client 是否为 None: {llm_client is None}")
-                print(f"🔥🔥🔥 [DEBUG] config['fixer']['use_llm']: {config['fixer']['use_llm']}")
-
                 self.ui.output_area.append("=" * 80)
+
+                # 🔥 再加一份控制台调试确认
+                print(f"🔥🔥🔥 [DEBUG] use_rules={config['fixer']['use_rules']}, use_llm={config['fixer']['use_llm']}")
+                print(f"🔥🔥🔥 [DEBUG] llm_client 实例: {llm_client}")
 
             # ===== 步骤5：创建协调Agent并执行 =====
             self.ui.output_area.append("\n🤖 创建多Agent系统...")
@@ -1911,15 +2009,15 @@ class EnhancedTabAI():
             self.ui.output_area.append(f"   修复失败: {fix_summary.get('failed', 0)} 个")
             self.ui.output_area.append(f"   总修复数: {fix_summary.get('total_fixes', 0)} 处")
 
-            # 验证结果
-            verification = results.get("verification", {})
-            verify_summary = verification.get("summary", {})
-
-            self.ui.output_area.append("\n✅ 验证结果:")
-            self.ui.output_area.append(f"   验证文件: {verify_summary.get('total_files', 0)} 个")
-            self.ui.output_area.append(f"   编译成功: {verify_summary.get('compile_success', 0)} 个")
-            self.ui.output_area.append(f"   编译失败: {verify_summary.get('compile_failed', 0)} 个")
-            self.ui.output_area.append(f"   平均修复率: {verify_summary.get('avg_fix_rate', 0):.1f}%")
+            # # 验证结果
+            # verification = results.get("verification", {})
+            # verify_summary = verification.get("summary", {})
+            #
+            # self.ui.output_area.append("\n✅ 验证结果:")
+            # self.ui.output_area.append(f"   验证文件: {verify_summary.get('total_files', 0)} 个")
+            # self.ui.output_area.append(f"   编译成功: {verify_summary.get('compile_success', 0)} 个")
+            # self.ui.output_area.append(f"   编译失败: {verify_summary.get('compile_failed', 0)} 个")
+            # self.ui.output_area.append(f"   平均修复率: {verify_summary.get('avg_fix_rate', 0):.1f}%")
 
             # 耗时统计
             exec_time = results.get("execution_time", {})
@@ -1932,6 +2030,18 @@ class EnhancedTabAI():
             self.ui.output_area.append("\n" + "=" * 80)
             self.ui.output_area.append("✨ 多Agent协作修复完成！")
             self.ui.output_area.append("=" * 80)
+
+            if ReportGenerator:
+                report = ReportGenerator(
+                    scan_result=results.get("scan_results", {}),
+                    fix_result=results.get("fix_results", {}),
+                    verify_result=results.get("verification", {})
+                )
+
+                output_path = "multi_agent_report.md"
+                report.generate_markdown(output_path)
+
+                self.ui.output_area.append(f"📄 报告已保存到: {output_path}")
 
             # ===== 步骤7：询问是否保存修复后的代码 =====
             fixed_files = fix_results.get("fixed_files", [])
@@ -1999,6 +2109,10 @@ class EnhancedTabAI():
             if show_details == QMessageBox.Yes:
                 self._show_detailed_results(results)
 
+            # 无论是否查看，都保存报告
+            path = self._save_detailed_results(results)
+            self.ui.output_area.append(f"\n📁 已自动保存修复报告：{path}\n")
+
             # 滚动到底部
             self.ui.output_area.moveCursor(QTextCursor.End)
 
@@ -2014,6 +2128,73 @@ class EnhancedTabAI():
                 "系统错误",
                 f"多Agent系统执行异常:\n\n{str(e)}\n\n详细信息已显示在输出区域"
             )
+
+    def _save_detailed_results(self, results):
+        """
+        保存更详细的结果到 reports/ 下，包括扫描、修复、验证、每条缺陷详情、LLM 修复输出
+        """
+        # 1. 创建 reports 目录
+        reports_dir = os.path.join(os.getcwd(), "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+
+        # 2. 文件名称
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(reports_dir, f"multi_agent_report_{ts}.md")
+
+        # 3. 开始写报告
+        lines = []
+        lines.append("# 🧾 Multi-Agent 详细修复报告\n")
+        lines.append(f"**生成时间**：{datetime.now()}\n")
+        lines.append("---\n")
+
+        # -------------- 扫描结果 --------------
+        scan = results.get("scan_results", {}) or {}
+        static_builtins = scan.get("static_builtin", [])
+        external = scan.get("external", {})
+        dynamic = scan.get("dynamic", {})
+
+        lines.append("## 🔍 扫描结果（详细）\n")
+
+        # 静态分析
+        lines.append(f"### 🐛 内置规则缺陷（{len(static_builtins)} 个）\n")
+        for idx, d in enumerate(static_builtins, 1):
+            lines.append(f"**{idx}. {d.get('file')}:{d.get('line')}**")
+            lines.append(f"- 严重性：{d.get('severity')}")
+            lines.append(f"- 规则：`{d.get('rule_id')}`")
+            lines.append(f"- 描述：{d.get('message')}")
+            if d.get("snippet"):
+                lines.append("```python")
+                lines.append(d.get("snippet"))
+                lines.append("```\n")
+
+        # 外部工具
+        lines.append("### 🔧 外部工具执行情况\n")
+        for tool, data in external.items():
+            lines.append(f"- {tool}: {data.get('count', 0)} 个问题")
+            if data.get("output"):
+                lines.append("```")
+                lines.append(data["output"])
+                lines.append("```")
+
+        # 动态检测
+        lines.append("### ⚠️ 动态编译错误\n")
+        for err in dynamic.get("py_compile", []):
+            lines.append(f"- {err.get('file')}: {err.get('error')}")
+
+        # -------------- 分析 --------------
+        analyze = results.get("analysis", {})
+        lines.append("\n## 📊 分析阶段\n")
+        lines.append(f"内容：\n```json\n{json.dumps(analyze, ensure_ascii=False, indent=2)}\n```\n")
+
+
+
+
+
+        # 保存文件
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        return path
 
     def _show_detailed_results(self, results: Dict[str, Any]):
         """显示详细的扫描和修复结果（辅助方法）"""
@@ -2071,3 +2252,7 @@ class EnhancedTabAI():
                         )
 
         self.ui.output_area.append("\n" + "=" * 80)
+
+        # 保存到报告文件
+        path = self._save_detailed_results(results)
+        self.ui.output_area.append(f"\n📁 详细报告已保存到：{path}\n")

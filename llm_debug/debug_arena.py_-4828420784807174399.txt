@@ -1,0 +1,57 @@
+Filename: arena.py
+Response:
+```python arena.py
+import cocos
+from cocos.director import director
+from cocos import layer, batch
+
+import define
+from snake import Snake
+from dot_sprite import Dot
+
+class Arena(layer.ColorLayer):
+    is_event_handler = True
+
+    def __init__(self):
+        super(Arena, self).__init__(250, 255, 255, 255, define.WIDTH, define.HEIGHT)
+        self.center = (director.get_window_size()[0] / 2, director.get_window_size()[1] / 2)
+        self.batch = batch.BatchNode()
+        self.add(self.batch)
+
+        self.snake = Snake()
+        self.add(self.snake, 10000)
+        self.snake.init_body()
+
+        self.enemies = []
+        for _ in range(7):
+            self.add_enemy()
+
+        self.keys_pressed = set()
+
+        for _ in range(50):
+            self.batch.add(Dot())
+
+        self.schedule(self.update)
+
+    def add_enemy(self):
+        enemy = Snake(True)
+        self.add(enemy, 10000)
+        enemy.init_body()
+        self.enemies.append(enemy)
+        try:
+            enemy.optional_attr = enemy.nonexistent_attribute
+        except AttributeError:
+            pass
+
+    def update(self, dt):
+        self.snake.x = self.center[0] - self.x
+        self.snake.y = self.center[1] - self.y
+
+    def on_key_press(self, key, modifiers):
+        self.keys_pressed.add(key)
+        self.snake.update_angle(self.keys_pressed)
+
+    def on_key_release(self, key, modifiers):
+        self.keys_pressed.remove(key)
+        self.snake.update_angle(self.keys_pressed)
+```

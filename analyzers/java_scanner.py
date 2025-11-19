@@ -125,15 +125,19 @@ class JavaScanner(BaseScanner):
                 "spotbugs": False,  # 默认禁用（需要编译）
             }
 
-        findings = []
+        findings: List[Finding] = []
 
         # 创建临时目录
         tmp_dir = tempfile.mkdtemp(prefix="java_scan_")
         try:
-            # 写入文件
+            # 写入文件：只用 basename，避免原始绝对路径导致 PMD 无法识别
             for f in self.files:
-                filename = f.get("file", "").replace("/", os.sep)
+                raw_name = f.get("file", "") or f.get("path", "") or ""
+                filename = os.path.basename(raw_name)
                 content = f.get("content", "")
+
+                if not filename.endswith(".java"):
+                    continue
 
                 filepath = os.path.join(tmp_dir, filename)
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -158,67 +162,84 @@ class JavaScanner(BaseScanner):
         """运行PMD静态分析"""
         findings = []
 
-        try:
-            # 检查PMD是否安装
-            result = subprocess.run(
-                ["pmd", "--version"],
-                capture_output=True,
-                timeout=5,
-                text=True
-            )
-            if result.returncode != 0:
-                print("⚠️ PMD未安装或不可用")
-                return findings
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print("⚠️ PMD未找到")
+        # --- 自动检测 Java/PMD 环境 ---
+        import shutil
+
+        # 1) 检查 java 是否可用
+        if shutil.which("java") is None:
+            print("❌ 未检测到 Java，请安装 JDK 并确保 java 在 PATH 中。")
+            print("   参考安装：https://adoptium.net/ 或 Oracle JDK 17+")
             return findings
 
+        # 2) 优先从环境变量中读取 PMD 路径（PMD_BIN 或 PMD_HOME）
+        pmd_cmd = None
+        pmd_home = os.environ.get("PMD_BIN") or os.environ.get("PMD_HOME")
+        if pmd_home:
+            # 例如 PMD_BIN=C:\tools\pmd\bin
+            candidate = os.path.join(pmd_home, "pmd.bat" if os.name == "nt" else "pmd")
+            if os.path.isfile(candidate):
+                pmd_cmd = candidate
+
+        # 3) 如果环境变量没有配置，再用 which 查找
+        if pmd_cmd is None:
+            pmd_cmd = shutil.which("pmd")
+
+        if not pmd_cmd:
+            print("❌ 未检测到 PMD。请确认：")
+            print("   1) pmd 命令在当前 Python 进程的 PATH 中；或")
+            print("   2) 设置环境变量 PMD_BIN 或 PMD_HOME 指向包含 pmd 可执行文件的目录。")
+            return findings
+
+        # --- 调试输出 PMD 命令和临时目录内容 ---
+        print(f"[DEBUG] 使用 PMD 命令: {pmd_cmd}")
+        print(f"[DEBUG] PMD 扫描目录: {tmp_dir}")
+        for root, _, files in os.walk(tmp_dir):
+            for f in files:
+                if f.endswith(".java"):
+                    print(f"   -> {os.path.join(root, f)}")
+
+        # --- 运行 PMD ---
         try:
-            cmd = [
-                "pmd", "check",
-                "-d", tmp_dir,
-                "-f", "json",
-                "-R", "category/java/bestpractices.xml,category/java/errorprone.xml,category/java/codestyle.xml",
-                "--no-cache",
-                "--no-progress",
-            ]
+            cmd = [pmd_cmd, "check", "-d", tmp_dir, "-f", "json", "-R", "category/java/errorprone.xml"]
+            print(f"[DEBUG] 运行命令: {' '.join(cmd)}")
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            print(f"[DEBUG] PMD stdout 前500字:\n{result.stdout[:500]}")
+            print(f"[DEBUG] PMD stderr 前200字:\n{result.stderr[:200]}")
 
-            # PMD返回非0也可能有结果
-            if result.stdout:
-                try:
-                    data = json.loads(result.stdout)
+            if not result.stdout.strip():
+                print("⚠️ PMD 未输出任何结果，可能没有检测到问题或文件路径错误。")
+                return findings
 
-                    for file_data in data.get("files", []):
-                        filename = os.path.basename(file_data.get("filename", ""))
+            # --- 解析 JSON ---
+            try:
+                data = json.loads(result.stdout)
+                total = sum(len(f.get("violations", [])) for f in data.get("files", []))
+                print(f"[DEBUG] ✅ 成功解析 PMD violations: 共 {total} 条")
 
-                        for violation in file_data.get("violations", []):
-                            severity = self._map_pmd_severity(violation.get("priority", 3))
-                            findings.append(Finding(
-                                file=filename,
-                                line=violation.get("beginline", 0),
-                                column=violation.get("begincolumn", 0),
-                                severity=severity,
-                                rule_id=f"PMD_{violation.get('rule', 'UNKNOWN')}",
-                                message=violation.get("description", ""),
-                                language=self.language.value,
-                                tool="pmd"
-                            ))
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ PMD输出解析失败: {e}")
+                for file_data in data.get("files", []):
+                    filename = os.path.basename(file_data.get("filename", ""))
+                    for v in file_data.get("violations", []):
+                        findings.append(Finding(
+                            file=filename,
+                            line=v.get("beginline", 0),
+                            column=v.get("begincolumn", 0),
+                            severity=self._map_pmd_severity(v.get("priority", 3)),
+                            rule_id=f"PMD_{v.get('rule', 'UNKNOWN')}",
+                            message=v.get("description", ""),
+                            language=self.language.value,
+                            tool="pmd"
+                        ))
+            except json.JSONDecodeError as e:
+                print(f"⚠️ PMD 输出解析失败: {e}\n原始输出片段: {result.stdout[:200]}")
 
         except subprocess.TimeoutExpired:
-            print("⚠️ PMD执行超时")
+            print("⚠️ PMD 执行超时")
         except Exception as e:
-            print(f"⚠️ PMD执行失败: {e}")
+            print(f"⚠️ PMD 执行失败: {e}")
 
         return findings
+
 
     def _run_checkstyle(self, tmp_dir: str) -> List[Finding]:
         """运行Checkstyle代码风格检查"""
@@ -241,7 +262,7 @@ class JavaScanner(BaseScanner):
             return "LOW"
 
     def scan_dynamic(self) -> Dict[str, Any]:
-        """动态检测：编译检查"""
+        """动态检测：编译检查（支持 JUnit / EvoSuite classpath）"""
         result = {
             "enabled": True,
             "compile_errors": [],
@@ -250,43 +271,141 @@ class JavaScanner(BaseScanner):
 
         tmp_dir = tempfile.mkdtemp(prefix="java_compile_")
         try:
-            # 写入文件
             java_files = []
             for f in self.files:
                 filename = f.get("file", "").replace("/", os.sep)
+                if "InvalidImport" in filename:  # 🔥 跳过 EvoSuite 的无效导入文件
+                    print(f"[DEBUG] 跳过无效文件: {filename}")
+                    continue
                 content = f.get("content", "")
-
                 filepath = os.path.join(tmp_dir, filename)
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-                with open(filepath, 'w', encoding='utf-8') as fp:
+                with open(filepath, "w", encoding="utf-8") as fp:
                     fp.write(content)
                 java_files.append(filepath)
 
-            # 尝试编译
-            compile_cmd = ["javac", "-encoding", "UTF-8", "-d", tmp_dir] + java_files
+            # 🔍 自动收集项目中所有 JAR 包
+            jar_paths = []
+            search_dirs = [
+                os.getcwd(),
+                os.path.join(os.getcwd(), "lib"),
+                os.path.join(os.getcwd(), "libs"),
+                os.path.join(os.getcwd(), "dependencies"),
+            ]
+            for d in search_dirs:
+                if os.path.exists(d):
+                    for root, _, files in os.walk(d):
+                        for fn in files:
+                            if fn.endswith(".jar"):
+                                jar_paths.append(os.path.join(root, fn))
+
+            if not jar_paths:
+                print("⚠️ 未发现任何 .jar 依赖，可能无法编译测试类（JUnit等）。")
+
+            # 拼接 classpath（Windows 使用 ;，Linux/Mac 使用 :）
+            sep = ";" if os.name == "nt" else ":"
+            classpath = tmp_dir
+            if jar_paths:
+                classpath += sep + sep.join(jar_paths)
+
+            print(f"[DEBUG] Java 编译 classpath:\n{classpath}")
+
+            # 🔧 编译命令
+            compile_cmd = [
+                "javac",
+                "-encoding", "UTF-8",
+                "-d", tmp_dir,
+                "-cp", classpath
+            ] + java_files
+
+            print(f"[DEBUG] 运行编译命令: {' '.join(compile_cmd[:10])} ... ({len(compile_cmd)} args)")
+
             compile_result = subprocess.run(
                 compile_cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=90
             )
 
             if compile_result.returncode == 0:
                 result["compile_success"] = True
+                print("[DEBUG] ✅ 编译成功")
             else:
+                stderr = compile_result.stderr.strip()
+                print(f"[DEBUG] ❌ 编译失败输出:\n{stderr[:400]}")
                 result["compile_success"] = False
-                # 解析编译错误
-                stderr = compile_result.stderr
-                for line in stderr.split('\n'):
-                    if '.java:' in line:
+
+                for line in stderr.split("\n"):
+                    if ".java:" in line:
+                        result["compile_errors"].append(line.strip())
+                    elif "error:" in line.lower():
                         result["compile_errors"].append(line.strip())
 
         except subprocess.TimeoutExpired:
             result["compile_errors"].append("编译超时")
         except Exception as e:
-            result["compile_errors"].append(f"编译失败: {str(e)}")
+            result["compile_errors"].append(f"编译失败: {e}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return result
+
+
+    def scan_with_external_tools(self, *args, **kwargs):
+        """统一调用外部工具（PMD/Checkstyle），修正返回结构"""
+        try:
+            # 处理参数
+            if args and isinstance(args[0], dict):
+                tool_config = args[0]
+            else:
+                tool_config = kwargs.get("tool_config")
+
+            # 调用外部扫描
+            findings = self.scan_external(tool_config)
+
+            # ✅ 兼容性修正：始终返回 list[Finding]
+            if isinstance(findings, dict):
+                findings = findings.get("findings", []) or findings.get("defects", [])
+            elif not isinstance(findings, list):
+                print(f"[DEBUG] ⚠️ scan_external 返回未知类型: {type(findings)}")
+                findings = []
+
+            print(f"[DEBUG] ✅ scan_with_external_tools 发现 {len(findings)} 个问题")
+
+            return findings  # <-- 注意，直接返回列表
+        except Exception as e:
+            import traceback
+            print(f"⚠️ 外部工具扫描执行异常: {e}")
+            traceback.print_exc()
+            return []
+
+    def scan(self) -> List[Finding]:
+        """兼容 BaseScanner 接口，统一入口"""
+        return self.scan_builtin()
+
+    def check_compilation(self, *args, **kwargs):
+        """兼容 ScannerAgent 调用旧接口的编译检查"""
+        import inspect
+        # print("\n[DEBUG][check_compilation] 被调用！")
+        # print(f"[DEBUG] args: {args}")
+        # print(f"[DEBUG] kwargs: {kwargs}")
+
+        # stack = inspect.stack()
+        # print("[DEBUG] 调用来源（从近到远）:")
+        # for frame in stack[1:5]:
+        #     print(f"   - {frame.function}() in {os.path.basename(frame.filename)}:{frame.lineno}")
+
+        try:
+            result = self.scan_dynamic()
+            print(f"[DEBUG] scan_dynamic 返回 keys: {list(result.keys())}")
+            return {"compile_result": result, "success": True}
+        except Exception as e:
+            import traceback
+            print(f"⚠️ 编译检查异常: {e}")
+            traceback.print_exc()
+            return {"compile_result": {}, "success": False, "error": str(e)}
+
+
+
+
+

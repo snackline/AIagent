@@ -376,7 +376,7 @@ class Worker(QThread):
         num_predict = int(self.config.get("num_predict", 2048))  # 默认2048
 
         options = {
-            "num_ctx": 4096,
+            "num_ctx": 40960,
             "num_predict": num_predict,
             "temperature": 0.2,
             "top_p": 0.9,
@@ -575,7 +575,7 @@ class EnhancedTabAI():
             traceback.print_exc()
 
     def _truncate_for_ctx(self, text: str, max_chars: int = 12000) -> str:
-        """为避免超出上下文（num_ctx=4096），对发送给模型的文本做一次保守字符级裁剪"""
+        """为避免超出上下文（num_ctx=40960），对发送给模型的文本做一次保守字符级裁剪"""
         if text and len(text) > max_chars:
             return text[:max_chars] + "\n\n[提示] 为满足上下文限制，已对上下文进行截断。"
         return text

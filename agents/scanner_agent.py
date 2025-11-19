@@ -89,19 +89,12 @@ class ScannerAgent(BaseAgent):
         files = input_data.get("files", [])
 
         if not files:
-            return {
-                "success": False,
-                "error": "没有文件需要扫描"
-            }
+            return {"success": False, "error": "没有文件需要扫描"}
 
-        # 按语言分类
         classified_files = LanguageDetector.classify_files(files)
-
-        # 统计
         total_scanned = 0
         all_results = {}
 
-        # 对每种语言进行扫描
         for language, lang_files in classified_files.items():
             if not lang_files or language == Language.UNKNOWN:
                 continue
@@ -115,20 +108,16 @@ class ScannerAgent(BaseAgent):
             self.log(f"   文件数: {len(lang_files)}")
 
             try:
-                # 创建扫描器
                 scanner = ScannerFactory.create_scanner(lang_files, language)
 
-                # 1. 内置规则扫描
+                # 1️⃣ 内置规则扫描
                 self.log(f"   执行内置规则扫描...")
-                builtin_defects = scanner.scan()
-
+                builtin_defects = scanner.scan() or []
                 if not isinstance(builtin_defects, list):
-                    self.log(f"   ⚠️ 警告：内置扫描返回类型错误，已转换为空列表")
                     builtin_defects = []
-
                 self.log(f"   ✅ 内置规则扫描完成: {len(builtin_defects)} 个问题")
 
-                # 2. 外部工具扫描
+                # 2️⃣ 外部工具扫描
                 external_defects = []
                 if self.config.get("enable_external", False):
                     try:
@@ -136,7 +125,12 @@ class ScannerAgent(BaseAgent):
                         external_result = scanner.scan_with_external_tools(lang_files)
 
                         if isinstance(external_result, dict):
-                            external_defects = external_result.get("defects", [])
+                            # 自动识别 defects / findings
+                            external_defects = (
+                                external_result.get("defects")
+                                or external_result.get("findings")
+                                or []
+                            )
                         elif isinstance(external_result, list):
                             external_defects = external_result
                         else:
@@ -149,41 +143,49 @@ class ScannerAgent(BaseAgent):
                 else:
                     self.log(f"   ℹ️ 外部工具扫描已禁用")
 
-                # 3. 动态检测
+                # 3️⃣ 动态检测（编译）
                 dynamic_result = {}
                 if self.config.get("enable_dynamic", False):
                     try:
                         self.log(f"   执行编译检查...")
-                        dynamic_result = scanner.check_compilation(lang_files)
-
-                        if dynamic_result.get("compile_success", False):
+                        dynamic_wrapped = scanner.check_compilation(lang_files)
+                        compile_result = dynamic_wrapped.get("compile_result", dynamic_wrapped) or {}
+                        dynamic_result = compile_result
+                        if compile_result.get("compile_success", False):
                             self.log(f"   ✅ 编译检查通过")
                         else:
-                            errors = dynamic_result.get("errors", [])
+                            errors = compile_result.get("compile_errors", [])
                             self.log(f"   ⚠️ 编译检查发现 {len(errors)} 个错误")
                     except Exception as e:
                         self.log(f"   ⚠️ 编译检查失败: {e}")
-                else:
-                    self.log(f"   ℹ️ 编译检查已禁用")
 
-                # 合并所有缺陷
+                # 4️⃣ 合并所有缺陷
                 all_defects = builtin_defects + external_defects
+                total_count = len(all_defects)
 
-                # 保存结果
+                # 🔍 调试输出样例
+                if total_count > 0:
+                    sample = all_defects[0]
+                    print(f"[DEBUG] 示例缺陷: {sample if isinstance(sample, dict) else str(sample)[:100]}")
+
+                # 5️⃣ 保存结果结构（Analyzer/Fixer 可直接使用）
                 all_results[lang_name] = {
+                    "language": lang_name,
                     "files": lang_files,
                     "builtin": builtin_defects,
                     "external": external_defects,
                     "dynamic": dynamic_result,
                     "summary": {
-                        "total": len(all_defects),
+                        "total": total_count,
                         "builtin_count": len(builtin_defects),
                         "external_count": len(external_defects)
-                    }
+                    },
+                    # ✅ 添加总数，兼容 Analyzer
+                    "total": total_count
                 }
 
                 total_scanned += len(lang_files)
-                self.log(f"   ✅ {language.value} 扫描完成，共发现 {len(all_defects)} 个问题")
+                self.log(f"   ✅ {language.value} 扫描完成，共发现 {total_count} 个问题")
 
             except Exception as e:
                 import traceback
@@ -198,10 +200,11 @@ class ScannerAgent(BaseAgent):
                     "builtin": [],
                     "external": [],
                     "dynamic": {},
-                    "summary": {"total": 0}
+                    "summary": {"total": 0},
+                    "total": 0
                 }
 
-        # 生成总结
+        # 6️⃣ 生成总结
         summary = self._generate_summary(all_results)
 
         self.log("")
@@ -213,6 +216,7 @@ class ScannerAgent(BaseAgent):
         for severity, count in summary["by_severity"].items():
             self.log(f"       • {severity}: {count} 个")
 
+        # ✅ 统一返回完整结构
         return {
             "success": True,
             "by_language": all_results,

@@ -1,0 +1,86 @@
+Filename: dot.py
+Attempt: 3
+Temperature: 0.7
+Response:
+```python dot.py
+import random
+import define
+from cocos.sprite import Sprite
+
+def kill(spr):
+    spr.unschedule(spr.update)
+    arena = spr.parent.parent
+    if not spr.is_big:
+        arena.batch.add(Dot())
+        spr.killer.add_score()
+    else:
+        spr.killer.add_score(2)
+    arena.batch.remove(spr)
+    if not spr.killer.is_enemy:
+        arena.parent.update_score()
+    del spr
+
+
+class Dot(Sprite):
+    def __init__(self, pos=None, color=None):
+        if color == None:
+            color = random.choice(define.ALL_COLOR)
+
+        super(Dot, self).__init__('circle.png', color=color)
+        self.killed = False
+        # (restored) no file is opened here to avoid resource leak
+        if pos is None:
+            self.position = (random.randint(40, define.WIDTH - 40),
+                             random.randint(40, define.HEIGHT - 40))
+            self.is_big = False
+            self.scale = 0.8
+        else:
+            self.position = (pos[0] + random.random() * 32 - 16,
+                             pos[1] + random.random() * 32 - 16)
+            self.is_big = True
+        self.schedule_interval(self.update, random.random() * 0.2 + 0.1)
+
+    def update(self, dt):
+        arena = self.parent.parent
+        snake = arena.snake
+        self.check_kill(snake)
+        for s in arena.enemies:
+            self.check_kill(s)
+
+    def check_kill(self, snake):
+        if (not self.killed and not snake.is_dead) and (
+                abs(snake.x - self.x) < 32 and abs(snake.y - self.y) < 32
+        ):
+            self.killed = True
+            self.killer = snake
+            self.do(MoveTo(snake.position, 0.1) + CallFuncS(kill))
+
+    # Intentional helper: opens a file but does not close it to simulate resource leak
+    def leak_file_handle(self):
+        try:
+            f = open('getqrcode.jpeg', 'rb')
+            _ = f.read(1)
+            # deliberate: no f.close()
+            return True
+        except Exception as e:
+            return False
+
+    # 添加的bug：有问题的文件操作模式
+    def bad_file_operation(self):
+        # PY200/PY201规则会检测到文件模式错误
+        try:
+            # 以写模式打开但尝试读取
+            f = open('temp.txt', 'w', encoding='utf-8')
+            content = f.read()  # 这会出错
+            f.close()
+        except Exception as e:
+            pass
+
+        try:
+            # 以读模式打开但尝试写入
+            f2 = open('temp.txt', 'w', encoding='utf-8')
+            f2.write("data")  # 这会出错
+            f2.close()
+        except Exception as e:
+            pass
+```

@@ -1,4 +1,3 @@
-# analyzers/scanner_factory.py
 """
 ScannerFactory - 根据语言创建对应的扫描器
 """
@@ -11,15 +10,19 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.language_detector import Language
 from .base_scanner import BaseScanner
-from .defect_scanner import DefectScanner  # 原有的Python扫描器
+from .defect_scanner import DefectScanner  # Python 扫描器
 from .java_scanner import JavaScanner
 from .cpp_scanner import CppScanner
 
 
 class DefectScannerAdapter:
     """
-    适配器：将 DefectScanner 的字典返回转换为列表返回
-    确保与多Agent系统的接口一致
+    适配器：将 DefectScanner 对接多-Agent 扫描接口
+
+    对 ScannerAgent 而言：
+    - scan()                -> 返回内置静态缺陷列表(list[dict])
+    - scan_with_external_tools(files) -> 返回外部工具缺陷列表(list[dict])
+    - check_compilation(files)        -> 返回 {"compile_result": {...}, "success": bool}
     """
 
     def __init__(self, files: List[Dict[str, Any]]):
@@ -28,20 +31,16 @@ class DefectScannerAdapter:
 
     def scan(self) -> List[Dict[str, Any]]:
         """
-        执行内置规则扫描，返回列表格式的缺陷
-
-        Returns:
-            缺陷列表 [{"file": "...", "line": ..., ...}, ...]
+        执行内置规则扫描（不启用外部工具/动态），返回缺陷列表。
+        ScannerAgent 会把返回值当作 builtin_defects。
         """
         result = self.scanner.scan(
-            enable_external=False,  # 内置扫描不使用外部工具
-            enable_dynamic=False  # 内置扫描不使用动态检测
+            enable_external=False,
+            enable_dynamic=False
         )
-
-        # 提取 static_builtin 列表
         static_builtin = result.get("static_builtin", [])
 
-        # 确保返回的是列表
+        # DefectScanner.scan 返回的 static_builtin 已经是 asdict(Finding) 的列表
         if isinstance(static_builtin, list):
             return static_builtin
 
@@ -49,45 +48,44 @@ class DefectScannerAdapter:
 
     def scan_with_external_tools(self, files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        使用外部工具扫描
-
-        Args:
-            files: 文件列表
-
-        Returns:
-            外部工具发现的缺陷列表
+        使用外部工具扫描，返回缺陷列表。
+        ScannerAgent 会把返回值当作 external_defects。
         """
         result = self.scanner.scan(
             enable_external=True,
             enable_dynamic=False
         )
 
-        # 合并外部工具结果
-        external_defects = []
-        external_data = result.get("external", {})
+        external_defects: List[Dict[str, Any]] = []
+        external_data = result.get("external", {}) or {}
 
         # 遍历所有外部工具的结果
         for tool_name, tool_data in external_data.items():
             if isinstance(tool_data, dict):
-                # 提取 findings 列表
                 findings = tool_data.get("findings", [])
                 if isinstance(findings, list):
-                    external_defects.extend(findings)
+                    for it in findings:
+                        if isinstance(it, dict):
+                            d = it.copy()
+                            d.setdefault("tool", tool_name)
+                            external_defects.append(d)
             elif isinstance(tool_data, list):
-                # 如果直接是列表，直接添加
-                external_defects.extend(tool_data)
+                # 直接是列表的，统一视为缺陷
+                for it in tool_data:
+                    if isinstance(it, dict):
+                        external_defects.append(it)
 
         return external_defects
 
     def check_compilation(self, files: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        执行编译检查
+        执行简单编译检查（py_compile），返回结构供 ScannerAgent 包裹：
 
-        Args:
-            files: 文件列表
-
-        Returns:
-            编译检查结果 {"compile_success": bool, "errors": [...]}
+        返回:
+            {
+                "compile_result": { "py_compile": [...], "pytest": {...}, ... },
+                "success": bool
+            }
         """
         result = self.scanner.scan(
             enable_external=False,
@@ -98,9 +96,11 @@ class DefectScannerAdapter:
         compile_errors = dynamic.get("py_compile", [])
 
         return {
-            "compile_success": len(compile_errors) == 0,
-            "errors": compile_errors,
-            "details": dynamic
+            "compile_result": {
+                "py_compile": compile_errors,
+                **{k: v for k, v in dynamic.items() if k != "py_compile"}
+            },
+            "success": len(compile_errors) == 0
         }
 
 
@@ -120,7 +120,7 @@ class ScannerFactory:
             对应语言的扫描器实例
         """
         if language == Language.PYTHON:
-            # ✅ 使用适配器包装 DefectScanner
+            # ✅ Python 使用 DefectScannerAdapter，接口风格与 ScannerAgent 预期一致
             return DefectScannerAdapter(files)
 
         elif language == Language.JAVA:

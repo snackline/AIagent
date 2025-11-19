@@ -27,19 +27,23 @@ class ReportGenerator:
         lines.append(f"\n**生成时间**: {self.timestamp}\n")
         lines.append("---\n")
 
-        # 1. 执行摘要
-        lines.append("## 📊 执行摘要\n")
+        # ============ 基础数据 ============
 
         static_defects = self.scan_result.get("static_builtin", [])
         dynamic_data = self.scan_result.get("dynamic", {})
         external_data = self.scan_result.get("external", {})
 
-        # 按严重性统计
+        fixed_files = self.fix_result.get("fixed_files", [])
+        total_fixed = self.fix_result.get("total_fixed", 0)
+
+        verified = self.verify_result.get("verified_files", [])
+        verify_errors = sum(1 for v in verified if v.get("compile_error"))
+
+        # 严重性数量
         high = sum(1 for d in static_defects if d.get("severity") == "HIGH")
         medium = sum(1 for d in static_defects if d.get("severity") == "MEDIUM")
         low = sum(1 for d in static_defects if d.get("severity") == "LOW")
 
-        # 动态检测
         compile_errors = len(dynamic_data.get("py_compile", []))
 
         # 外部工具统计
@@ -49,6 +53,9 @@ class ReportGenerator:
             if isinstance(tool_data, dict):
                 external_count += tool_data.get("count", 0)
 
+        # ============ 执行摘要 ============
+
+        lines.append("## 📊 执行摘要\n")
         lines.append("### 🎯 总体情况\n")
         lines.append(f"- **静态分析（内置规则）**: {len(static_defects)} 个")
         lines.append(f"  - 🔴 高危: {high} 个")
@@ -58,159 +65,76 @@ class ReportGenerator:
         lines.append(f"- **动态检测（编译错误）**: {compile_errors} 个")
         lines.append(f"- **总计问题**: {len(static_defects) + external_count + compile_errors} 个\n")
 
-        # 修复统计
-        fixed_files = self.fix_result.get("fixed_files", [])
-        total_fixed = self.fix_result.get("total_fixed", 0)
         lines.append(f"- **成功修复**: {total_fixed} 个问题")
         lines.append(f"- **修复文件数**: {len(fixed_files)} 个\n")
-
-        # 验证结果
-        verified = self.verify_result.get("verified_files", [])
-        verify_errors = sum(1 for v in verified if v.get("compile_error"))
         lines.append(f"- **验证通过**: {len(verified) - verify_errors} 个文件")
         lines.append(f"- **验证失败**: {verify_errors} 个文件\n")
 
-        # 2. 外部工具详情
-        if external_data:
-            lines.append("## 🔧 外部工具执行情况\n")
-            lines.append("| 工具 | 检测数量 | 状态 |")
-            lines.append("|------|---------|------|")
-            for tool in ["ruff", "pylint", "mypy", "bandit"]:
-                data = external_data.get(tool, {})
-                if isinstance(data, dict):
-                    count = data.get("count", 0)
-                    if "error" in data:
-                        status = f"❌ 错误: {data['error'][:50]}"
-                    elif "stderr" in data and "No module named" in data["stderr"]:
-                        status = "⚠️ 未安装"
-                    else:
-                        status = "✅ 正常"
-                    lines.append(f"| {tool} | {count} | {status} |")
-            lines.append("")
+        # ============ 外部工具详情 ============
 
-            # 3. 缺陷详情（带修复方案）
-            lines.append("## 🐛 缺陷详情与修复方案\n")
+        lines.append("## 🔧 外部工具执行情况\n")
+        lines.append("| 工具 | 检测数量 | 状态 |")
+        lines.append("|------|---------|------|")
 
-            for severity in ["HIGH", "MEDIUM", "LOW"]:
-                severity_defects = [d for d in static_defects if d.get("severity") == severity]
-                if not severity_defects:
-                    continue
+        for tool in ["ruff", "pylint", "mypy", "bandit"]:
+            data = external_data.get(tool, {})
+            if isinstance(data, dict):
+                count = data.get("count", 0)
+                if "error" in data:
+                    status = f"❌ 错误: {data['error'][:50]}"
+                elif "stderr" in data and "No module named" in data["stderr"]:
+                    status = "⚠️ 未安装"
+                else:
+                    status = "✅ 正常"
+                lines.append(f"| {tool} | {count} | {status} |")
 
-                icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}[severity]
-                lines.append(f"### {icon} {severity} 级别 ({len(severity_defects)} 个)\n")
+        lines.append("")
 
-                # 按文件分组
-                by_file: Dict[str, List] = {}
-                for d in severity_defects:
-                    file = d.get("file", "unknown")
-                    by_file.setdefault(file, []).append(d)
+        # ============ 缺陷详情（带修复方案） ============
 
-                for file, file_defects in sorted(by_file.items()):
-                    lines.append(f"#### 📄 `{file}`\n")
+        lines.append("## 🐛 缺陷详情与修复方案\n")
 
-                    for i, d in enumerate(file_defects, 1):
-                        rule_id = d.get("rule_id", "")
-                        line_no = d.get("line", 0)
-                        msg = d.get("message", "")
-                        snippet = d.get("snippet", "").strip()
+        for severity in ["HIGH", "MEDIUM", "LOW"]:
+            severity_defects = [d for d in static_defects if d.get("severity") == severity]
+            if not severity_defects:
+                continue
 
-                        lines.append(f"**{i}. [{rule_id}] 第 {line_no} 行**")
-                        lines.append(f"- **问题**: {msg}")
-                        if snippet:
-                            lines.append(f"- **原代码**:")
-                            lines.append(f"  ```python")
-                            lines.append(f"  {snippet}")
-                            lines.append(f"  ```")
+            icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}[severity]
+            lines.append(f"### {icon} {severity} 级别 ({len(severity_defects)} 个)\n")
 
-                        # 添加修复方案
-                        fix_suggestion = self._get_fix_suggestion(rule_id, snippet, msg)
-                        if fix_suggestion:
-                            lines.append(f"- **修复方案**:")
-                            lines.append(f"  ```python")
-                            lines.append(f"  {fix_suggestion}")
-                            lines.append(f"  ```")
+            by_file = {}
+            for d in severity_defects:
+                by_file.setdefault(d["file"], []).append(d)
 
-                        lines.append("")
+            for file, file_defects in sorted(by_file.items()):
+                lines.append(f"#### 📄 `{file}`\n")
 
-            # ... 后面的代码保持不变 ...
+                for i, d in enumerate(file_defects, 1):
+                    rule_id = d.get("rule_id", "")
+                    line_no = d.get("line", 0)
+                    msg = d.get("message", "")
+                    snippet = d.get("snippet", "").strip()
 
-            report = "\n".join(lines)
+                    lines.append(f"**{i}. [{rule_id}] 第 {line_no} 行**")
+                    lines.append(f"- **问题**: {msg}")
 
-            if output_path:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(report)
+                    if snippet:
+                        lines.append("- **原代码**:")
+                        lines.append("  ```python")
+                        lines.append(f"  {snippet}")
+                        lines.append("  ```")
 
-            return report
+                    fix_suggestion = self._get_fix_suggestion(rule_id, snippet, msg)
+                    if fix_suggestion:
+                        lines.append("- **修复方案**:")
+                        lines.append("  ```python")
+                        lines.append(f"  {fix_suggestion}")
+                        lines.append("  ```")
 
-        def _get_fix_suggestion(self, rule_id: str, snippet: str, message: str) -> str:
-            """根据规则ID生成修复建议"""
+                    lines.append("")
 
-            # AST001: 可变默认参数
-            if rule_id == "AST001":
-                if "tags: List[str] = []" in snippet:
-                    return "tags: List[str] = field(default_factory=list)  # 使用 field(default_factory=list)"
-                elif "= []" in snippet:
-                    return snippet.replace("= []", "= None  # 在 __post_init__ 中初始化为 []")
-                elif "= {}" in snippet:
-                    return snippet.replace("= {}", "= None  # 在 __post_init__ 中初始化为 {}")
+        # ============ 动态检测（编译错误） ============
 
-            # AST002: is 比较
-            elif rule_id == "AST002":
-                if " is " in snippet:
-                    return snippet.replace(" is ", " == ")
-                elif " is not " in snippet:
-                    return snippet.replace(" is not ", " != ")
-
-            # AST003: 函数调用作为默认值
-            elif rule_id == "AST003":
-                if "datetime.now()" in snippet:
-                    return snippet.replace("datetime.now()", "None  # 在 __post_init__ 中设置")
-
-            # PY100: 未定义名称（这个通常是真实bug）
-            elif rule_id == "PY100":
-                if "colour" in message:
-                    return "# 定义 colour 函数或导入: from termcolor import colored as colour"
-
-            # PY202: max() 空序列
-            elif rule_id == "PY202":
-                if "max(" in snippet:
-                    return snippet.replace("max(", "max(").replace(")", ", default=0)")
-
-            # PY203: list.remove 错误
-            elif rule_id == "PY203":
-                if ".remove(" in snippet and "task_id" in snippet:
-                    return "tasks.remove(task)  # 传入对象而非 ID"
-
-            # PY051: 覆盖内建名
-            elif rule_id == "PY051" or "PL-redefined-builtin" in rule_id:
-                if "list =" in snippet:
-                    return snippet.replace("list =", "task_list =")
-
-            # RUFF-W292: 文件末尾缺少换行
-            elif rule_id == "RUFF-W292":
-                return "# 在文件末尾添加一个空行"
-
-            # RUFF-I001: import 排序
-            elif rule_id == "RUFF-I001":
-                return "# 使用 'ruff check --fixers' 或 'isort' 自动排序导入"
-
-            # PL-unexpected-keyword-arg: 参数名错误
-            elif "unexpected-keyword-arg" in rule_id.lower():
-                if "filter_tag=" in snippet:
-                    return snippet.replace("filter_tag=", "filter_by_tag=")
-
-            # PL-assignment-from-no-return: 赋值无返回值函数
-            elif "assignment-from-no-return" in rule_id.lower():
-                return "# 移除赋值语句，直接调用函数"
-
-            # PL-unspecified-encoding: 缺少 encoding
-            elif "unspecified-encoding" in rule_id.lower():
-                if 'open(' in snippet and 'encoding' not in snippet:
-                    return snippet.replace('open(', 'open(').replace(')', ', encoding="utf-8")')
-
-            return ""
-
-        # 4. 动态检测错误
         if compile_errors > 0:
             lines.append("## ⚠️ 动态检测（编译错误）\n")
             for err in dynamic_data.get("py_compile", [])[:10]:
@@ -218,36 +142,24 @@ class ReportGenerator:
                 error = err.get("error", "")[:200]
                 lines.append(f"- **{file}**: {error}\n")
 
-        # 5. 修复详情
-        if fixed_files:
-            lines.append("## ✅ 修复详情\n")
-            for f in fixed_files[:20]:  # 最多显示20个文件
-                file = f.get("file", "unknown")
-                changes = f.get("changes", [])
-                lines.append(f"### 📄 `{file}`\n")
-                lines.append(f"- **修复规则数**: {len(changes)}")
 
-                if changes:
-                    lines.append("- **修复项**:")
-                    for c in changes[:5]:  # 每个文件最多显示5个修复
-                        rule = c.get("rule_id", "")
-                        line_no = c.get("line", 0)
-                        lines.append(f"  - 第 {line_no} 行: `{rule}`")
-                lines.append("")
 
-        # 6. 验证结果
+        # ============ 验证结果 ============
+
         if verified:
             lines.append("## 🔍 验证结果\n")
-            for v in verified[:20]:
+            for v in verified:
                 file = v.get("file", "unknown")
+
                 if v.get("compile_error"):
                     lines.append(f"- ❌ **{file}**: 编译失败")
-                    lines.append(f"  ```\n  {v.get('compile_error')[:200]}\n  ```")
                 else:
                     lines.append(f"- ✅ **{file}**: 验证通过")
+
             lines.append("")
 
-        # 7. 修复建议
+        # ============ 修复建议 ============
+
         lines.append("## 💡 修复建议\n")
         if high > 0:
             lines.append("1. **优先修复高危问题**（安全漏洞、语法错误、未定义名称）")
@@ -256,18 +168,20 @@ class ReportGenerator:
         if medium > 0:
             lines.append("3. **处理中危问题**（逻辑错误、类型问题、可变默认参数）")
         if verify_errors > 0:
-            lines.append("4. **人工 Review 验证失败的文件**（可能是误修复）")
-        lines.append("5. **运行完整测试套件**确保修复未引入新问题")
-        lines.append("6. **代码审查**确认修复符合项目规范\n")
+            lines.append("4. **检查验证失败的文件**（可能存在语义问题）")
+        lines.append("5. **建议运行完整测试套件**")
+        lines.append("6. **建议进行代码审查（Code Review）**\n")
+
+        # ============ 保存 & 返回 ============
 
         report = "\n".join(lines)
 
-        # 保存到文件
         if output_path:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(report)
 
         return report
+
 
     def _get_fix_suggestion(self, rule_id: str, snippet: str, message: str) -> str:
         """根据规则ID生成修复建议"""

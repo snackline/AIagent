@@ -157,125 +157,162 @@ class AnalyzerAgent(BaseAgent):
                 self.log(f"   {i}. {lang.upper()}: {plan['total_issues']} 个问题 "
                          f"(HIGH={plan['high']}, MEDIUM={plan['medium']}, LOW={plan['low']})")
 
+        # ==========================================================
+        # 🔧 自动构建 issues_by_file，确保 FixerAgent 可读取
+        # ==========================================================
+        by_language_with_files = {}
+        for plan in strategy["fix_plans"]:
+            lang = plan["language"]
+            builtin = plan.get("builtin_issues", [])
+            external = plan.get("external_issues", [])
+            all_issues = builtin + external
+
+            issues_by_file = {}
+            for issue in all_issues:
+                file = "unknown"
+
+                # ✅ 情况1：字典
+                if isinstance(issue, dict):
+                    raw_file = issue.get("file") or issue.get("filename") or issue.get("path")
+                    if raw_file:
+                        file = os.path.basename(str(raw_file))
+                    elif "Finding" in str(type(issue)):
+                        # 针对 dataclass/Finding 对象转 dict
+                        file = getattr(issue, "file", getattr(issue, "filename", "unknown")) or "unknown"
+
+                # ✅ 情况2：自定义对象（如 PMD Finding）
+                elif hasattr(issue, "__dict__"):
+                    # 通常 PMD 的 Finding 对象有 file、filename、message 等属性
+                    file = getattr(issue, "file", getattr(issue, "filename", "unknown"))
+                    if not file:
+                        file = "unknown"
+
+                # ✅ 情况3：字符串
+                elif isinstance(issue, str):
+                    parts = issue.split(":") if ":" in issue else []
+                    file = os.path.basename(parts[0].strip()) if parts else "unknown"
+
+                issues_by_file.setdefault(file, []).append(issue)
+
+            by_language_with_files[lang] = {
+                "total": plan["total_issues"],
+                "issues_by_file": issues_by_file,
+                "summary": {
+                    "high": plan["high"],
+                    "medium": plan["medium"],
+                    "low": plan["low"]
+                }
+            }
+
+        # 将该结构写入 self.analysis_results，供后续阶段调用
+        self.analysis_results = {"by_language": by_language_with_files}
+        # ==========================================================
+
+
         return strategy
 
     # agents/analyzer_agent.py
 
     def execute(self, decision: Dict[str, Any]) -> Dict[str, Any]:
-        """执行阶段：生成详细的分析报告"""
+        """执行阶段：生成详细的分析报告（兼容 Finding、dict、str 三种格式）"""
         fix_plans = decision.get("fix_plans", [])
         recommendations = decision.get("recommendations", [])
 
         analysis_report = {
             "summary": {
                 "total_languages": len(fix_plans),
-                "total_issues": sum(plan["total_issues"] for plan in fix_plans),
-                "high_priority": sum(plan["high"] for plan in fix_plans),
-                "medium_priority": sum(plan["medium"] for plan in fix_plans),
-                "low_priority": sum(plan["low"] for plan in fix_plans),
+                "total_issues": sum(plan.get("total_issues", 0) for plan in fix_plans),
+                "high_priority": sum(plan.get("high", 0) for plan in fix_plans),
+                "medium_priority": sum(plan.get("medium", 0) for plan in fix_plans),
+                "low_priority": sum(plan.get("low", 0) for plan in fix_plans),
             },
             "by_language": {},
             "recommendations": recommendations,
             "fix_plans": fix_plans
         }
 
-        # 按语言分组问题
+        # =============================
+        # 🔍 按语言分组问题
+        # =============================
         for plan in fix_plans:
             lang = plan["language"]
+            builtin_issues = plan.get("builtin_issues", [])
+            external_issues = plan.get("external_issues", [])
+            all_issues = builtin_issues + external_issues
 
-            # 合并内置和外部工具的问题
-            all_issues = plan["builtin_issues"] + plan["external_issues"]
-
-            # ✅ 按文件分组（增强文件名提取）
             issues_by_file = {}
+
             for issue in all_issues:
-                # ✅ 处理字符串和字典两种格式
+                file = "unknown"
+
+                # ✅ 1. 字典类型
                 if isinstance(issue, dict):
-                    # 尝试多种文件名字段
-                    raw_file = (
-                            issue.get("file") or
-                            issue.get("filename") or
-                            issue.get("path") or
-                            "unknown"
-                    )
+                    raw_file = issue.get("file") or issue.get("filename") or issue.get("path")
+                    if raw_file:
+                        file = os.path.basename(str(raw_file))
 
-                    # ✅ 规范化文件名（去除路径）
-                    if raw_file and raw_file != "unknown":
-                        # 处理 Windows/Linux 路径
-                        if "\\" in raw_file or "/" in raw_file:
-                            file = os.path.basename(raw_file)
-                            # 🔥 调试
-                            if DEBUG_ANALYZER:
-                                print(f"[AnalyzerAgent] 文件名规范化: {raw_file} -> {file}")
-                        else:
-                            file = raw_file
-                    else:
-                        file = "unknown"
+                # ✅ 2. PMD/Finding 对象（dataclass 或 namedtuple）
+                elif hasattr(issue, "__dict__") or "Finding" in str(type(issue)):
+                    # 安全获取属性
+                    file = getattr(issue, "file", None) or getattr(issue, "filename", None) or "unknown"
+                    file = os.path.basename(str(file)) if file else "unknown"
 
-                    if file not in issues_by_file:
-                        issues_by_file[file] = []
-                    issues_by_file[file].append(issue)
-
+                # ✅ 3. 字符串类型
                 elif isinstance(issue, str):
-                    # 字符串类型，尝试从内容提取文件名
-                    file = "unknown"
-                    # 简单的文件名提取（格式：file.py:line: message）
-                    if ":" in issue:
-                        parts = issue.split(":")
-                        if len(parts) > 0:
-                            raw_file = parts[0].strip()
-                            # ✅ 规范化
-                            file = os.path.basename(raw_file) if raw_file else "unknown"
+                    parts = issue.split(":") if ":" in issue else []
+                    file = os.path.basename(parts[0].strip()) if parts else "unknown"
 
-                    if file not in issues_by_file:
-                        issues_by_file[file] = []
+                issues_by_file.setdefault(file, []).append(issue)
 
-                    # 转换为字典格式
-                    issues_by_file[file].append({
-                        "type": "external_tool",
-                        "severity": "MEDIUM",
-                        "message": issue,
-                        "file": file,
-                        "language": lang
-                    })
-
-            # 🔥 调试：输出分组结果
+            # =============================
+            # 🔍 调试输出：文件分布
+            # =============================
             if DEBUG_ANALYZER:
-                print(f"\n[AnalyzerAgent] {lang.upper()} 问题分组结果:")
-                for fname, issues_list in issues_by_file.items():
-                    print(f"  - {fname}: {len(issues_list)} 个问题")
+                print(f"\n[AnalyzerAgent] {lang.upper()} 问题分组结果：")
+                for fname, issue_list in sorted(issues_by_file.items()):
+                    print(f"  - {fname}: {len(issue_list)} 个问题")
+                    # 打印前三条
+                    for ex in issue_list[:3]:
+                        msg = ""
+                        if isinstance(ex, dict):
+                            msg = ex.get("message", "")
+                        elif hasattr(ex, "message"):
+                            msg = getattr(ex, "message", "")
+                        else:
+                            msg = str(ex)
+                        print(f"      → {msg[:120]}")
 
-            # 按严重程度分组
+            # =============================
+            # ⚙️ 按严重程度分组
+            # =============================
             issues_by_severity = {"HIGH": [], "MEDIUM": [], "LOW": []}
 
             for issue in all_issues:
                 if isinstance(issue, dict):
                     severity = issue.get("severity", "LOW")
-                    if severity in issues_by_severity:
-                        issues_by_severity[severity].append(issue)
-                elif isinstance(issue, str):
-                    # 从字符串判断严重程度
-                    severity = "MEDIUM"
-                    if any(kw in issue.lower() for kw in ["error", "critical", "fatal"]):
+                elif hasattr(issue, "severity"):
+                    severity = getattr(issue, "severity", "LOW")
+                else:
+                    s = str(issue).lower()
+                    if any(k in s for k in ["error", "critical", "fatal"]):
                         severity = "HIGH"
-                    elif any(kw in issue.lower() for kw in ["warning", "info"]):
+                    elif any(k in s for k in ["warning", "info"]):
                         severity = "LOW"
+                    else:
+                        severity = "MEDIUM"
 
-                    issue_dict = {
-                        "type": "external_tool",
-                        "severity": severity,
-                        "message": issue,
-                        "language": lang
-                    }
-                    issues_by_severity[severity].append(issue_dict)
+                issues_by_severity.setdefault(severity, []).append(issue)
 
             analysis_report["by_language"][lang] = {
-                "total": plan["total_issues"],
+                "total": plan.get("total_issues", len(all_issues)),
                 "issues_by_file": issues_by_file,
                 "issues_by_severity": issues_by_severity,
-                "dynamic_check": plan["dynamic_results"]
+                "dynamic_check": plan.get("dynamic_results", {})
             }
 
+        # =============================
+        # ✅ 汇总日志
+        # =============================
         self.log("\n✅ 分析完成！")
         self.log(f"   - 涉及语言: {analysis_report['summary']['total_languages']} 种")
         self.log(f"   - 总问题数: {analysis_report['summary']['total_issues']} 个")
@@ -289,6 +326,8 @@ class AnalyzerAgent(BaseAgent):
                 self.log(f"   {rec}")
 
         return analysis_report
+
+
 
 
 # 兼容旧版本的analyze方法

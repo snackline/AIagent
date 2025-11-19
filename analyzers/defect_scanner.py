@@ -3,6 +3,11 @@
 DefectScanner - 增强版缺陷检测器
 支持：AST 安全规则、Python2 兼容、未定义名、可变默认参数、函数参数错误等
 外部工具：ruff（旧版兼容）、mypy（文本模式）、bandit
+
+本版改动（符合用户要求）：
+- 始终合并相似问题（同文件+同规则+相似消息），保留 1 条并记录 count/examples；不做限流
+- 外部工具的发现“全部保留”，不按严重度过滤
+- 不使用环境变量控制开关
 """
 
 from __future__ import annotations
@@ -15,8 +20,9 @@ import shutil
 import subprocess
 import tempfile
 import py_compile
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Tuple, Optional, Set
+from dataclasses import dataclass, asdict, field
+from typing import Dict, Any, List, Tuple, Optional, Set, DefaultDict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEBUG_SCANNER = os.environ.get("SCANNER_DEBUG", "0") == "1"
@@ -32,10 +38,35 @@ class Finding:
     rule_id: str
     message: str
     snippet: str = ""
+    # 兼容性增强：合并后提供计数与示例（不会影响旧管线消费）
+    count: int = 1
+    examples: List[int] = field(default_factory=list)
 
 
 def _basename(p: str) -> str:
     return (p or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def _normalize_msg_for_group(msg: str) -> str:
+    """
+    归一化消息文本用于聚合相似问题：
+    - 屏蔽路径/字符串字面量/数字，减少同类但细节不同的重复
+    """
+    if not msg:
+        return ""
+    s = str(msg)
+    # 路径
+    s = re.sub(r"[A-Za-z]:[\\/].*?(?=\s|$)", "<PATH>", s)
+    s = re.sub(r"[\\/][^\\/\s]+(?:[\\/][^\\/\s]+)+", "<PATH>", s)
+    # 字符串字面量
+    s = re.sub(r"'[^']*'", "'<STR>'", s)
+    s = re.sub(r'"[^"]*"', '"<STR>"', s)
+    # 数字/十六进制
+    s = re.sub(r"\b0x[0-9a-fA-F]+\b", "<HEX>", s)
+    s = re.sub(r"\b\d+\b", "<NUM>", s)
+    # 空白规整
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 class _ComprehensiveAstVisitor(ast.NodeVisitor):
@@ -270,30 +301,26 @@ class _ComprehensiveAstVisitor(ast.NodeVisitor):
         if isinstance(node.ctx, ast.Load):
             name = node.id
 
-            # 🔥 新增：宽松模式 - 只检测明显的未定义名称
-            # 排除条件更宽泛，减少误报
+            # 宽松模式，尽量减少误报
             is_likely_undefined = (
                     name not in self.defined_names and
                     name not in self.imported_names and
                     name not in self.builtin_names and
-                    # 🔥 排除单字母变量（循环变量、Lambda参数等）
                     len(name) > 1 and
-                    # 🔥 排除下划线开头（私有变量、魔法方法等）
                     not name.startswith('_') and
-                    # 🔥 排除常见的第三方库名称（容错）
                     name not in {'pd', 'np', 'plt', 'tf', 'torch', 'cv2', 'requests', 'json', 'time', 'datetime', 'os',
                                  'sys', 're', 'math', 'random'}
             )
 
             if is_likely_undefined:
-                # 🔥 降低严重程度：HIGH → MEDIUM
+                # 降级为 MEDIUM
                 self._add(node, "MEDIUM", "PY100", f"疑似使用了未定义的名称 '{name}'（可能为动态导入或第三方库）。")
         elif isinstance(node.ctx, ast.Store):
             self.defined_names.add(node.id)
 
         self.generic_visit(node)
 
-    # ========== is 比较检测 ==========
+    # ========== is 比较检测（保持与原版一致）==========
     def visit_Compare(self, node: ast.Compare):
         for op in node.ops:
             if isinstance(op, (ast.Is, ast.IsNot)):
@@ -345,7 +372,8 @@ class DefectScanner:
         # 过滤代码文件
         filtered = []
         for f in files:
-            name = f.get("name") or f.get("path") or ""
+            # ✅ 兼容 "file" / "path" / "name" 三种 key
+            name = f.get("file") or f.get("path") or f.get("name") or ""
             ext = os.path.splitext(name)[1].lower()
             if ext in CODE_FILE_EXTS:
                 filtered.append(f)
@@ -354,7 +382,7 @@ class DefectScanner:
         # 构建文件映射
         self.file_map: Dict[str, str] = {}
         for f in self.files:
-            name = f.get("path") or f.get("name") or ""
+            name = f.get("file") or f.get("path") or f.get("name") or ""
             basename = _basename(name)
             self.file_map[basename] = f.get("content", "")
 
@@ -372,10 +400,15 @@ class DefectScanner:
             external_findings: List[Finding] = []
             if enable_external and written_paths:
                 external_res = self.run_external_tools(tmp_dir, written_paths, dynamic_timeout)
+                # 全量保留外部工具发现（不按严重度过滤）
                 external_findings = self._external_to_findings(external_res)
 
             # 合并所有静态检查结果
             merged = builtin_findings + external_findings
+
+            # 后处理：去重 + 合并相似（不做限流）
+            merged = self._postprocess_findings(merged)
+
             result["static_builtin"] = [asdict(f) for f in merged]
             result["external"] = external_res
 
@@ -394,7 +427,8 @@ class DefectScanner:
     def run_static_builtin(self) -> List[Finding]:
         findings: List[Finding] = []
         for f in self.files:
-            path = f.get("path", f.get("name", ""))
+            # ✅ 兼容 file / path / name
+            path = f.get("file") or f.get("path") or f.get("name", "")
             basename = _basename(path)
             content = f.get("content", "")
 
@@ -416,8 +450,8 @@ class DefectScanner:
                 snippet = lines[line - 1][:200] if 1 <= line <= len(lines) else ""
                 findings.append(Finding(basename, line, 0, "HIGH", "PY000",
                                         f"语法错误：{e.msg}", snippet))
-                # 即使语法错误也做文本检查
                 findings.extend(self._scan_text_level(basename, content))
+
         return findings
 
     def _scan_text_level(self, basename: str, content: str) -> List[Finding]:
@@ -429,19 +463,10 @@ class DefectScanner:
             snippet = lines[line_no - 1][:200] if 1 <= line_no <= len(lines) else ""
             res.append(Finding(basename, line_no, 0, sev, rule, msg, snippet))
 
-        # 🔥 选项1：完全禁用文本级检查（最激进）
-        # return res  # 直接返回空列表
-
-        # 🔥 选项2：只保留高危检查，移除低危检查
         # Python 2 兼容性 - 保留
         for m in re.finditer(r"\bxrange\s*\(", content):
             ln = content[:m.start()].count("\n") + 1
-            add(ln, "PY201", "检测到 Python 2 的 xrange()，在 Python 3 中应改为 range()。", "MEDIUM")  # 🔥 降级为 MEDIUM
-
-        # 🔥 移除 raw_input 检查（不常见）
-        # for m in re.finditer(r"\braw_input\s*\(", content):
-        #     ln = content[:m.start()].count("\n") + 1
-        #     add(ln, "PY203", "检测到 Python 2 的 raw_input()...", "MEDIUM")
+            add(ln, "PY201", "检测到 Python 2 的 xrange()，在 Python 3 中应改为 range()。", "MEDIUM")
 
         # 文件打开模式错误 - 保留（实用）
         for m in re.finditer(r'open\([^)]*,\s*["\']w["\']\s*\).*?\.read\(', content):
@@ -452,16 +477,6 @@ class DefectScanner:
             ln = content[:m.start()].count("\n") + 1
             add(ln, "PY201", "以只读模式 'r' 打开文件后尝试写入，应使用 'w' 或 'a'。", "HIGH")
 
-        # 🔥 移除 max() 检查（误报率高）
-        # for m in re.finditer(r'max\([^)]*\bfor\b[^)]*\)', content):
-        #     ln = content[:m.start()].count("\n") + 1
-        #     add(ln, "PY202", "在生成器上使用 max()...", "MEDIUM")
-
-        # 🔥 移除 list.remove() 检查（误报率极高）
-        # for m in re.finditer(r'\.remove\(\s*\w+\s*\)', content):
-        #     ln = content[:m.start()].count("\n") + 1
-        #     add(ln, "PY203", "list.remove() 要求参数为列表中的元素...", "LOW")
-
         return res
 
     # ========== 写入临时目录 ==========
@@ -469,7 +484,7 @@ class DefectScanner:
         tmp_dir = tempfile.mkdtemp(prefix="scan_")
         written_paths: List[str] = []
         for f in self.files:
-            name = f.get("path") or f.get("name") or ""
+            name = f.get("file") or f.get("path") or f.get("name") or ""
             base = _basename(name)
             if not base:
                 continue
@@ -569,8 +584,9 @@ class DefectScanner:
             external["spotbugs"] = {"error": str(e)}
 
         return external
+
     def _run_ruff(self, cwd: str, files: List[str], timeout: int) -> Dict[str, Any]:
-        """ruff 兼容旧版，使用 --output-format json"""
+        """ruff 兼容旧版，使用 --format json"""
         # 方式1：尝试新版 --format
         code, out, err = self._run_cli_or_module(
             bin_name="ruff",
@@ -841,6 +857,49 @@ class DefectScanner:
         summary["pytest"] = {"skipped": True, "reason": "未配置测试"}
         return summary
 
+    # ========== 合并相似/去重（无上限） ==========
+    def _postprocess_findings(self, items: List[Finding]) -> List[Finding]:
+        if not items:
+            return []
+
+        # 1) 精确去重：file + line + rule_id + 归一化消息
+        seen: Set[Tuple[str, int, str, str]] = set()
+        deduped: List[Finding] = []
+        for f in items:
+            key = (f.file, int(f.line), f.rule_id, _normalize_msg_for_group(f.message))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(f)
+
+        # 2) 合并相似：file + rule_id + 归一化消息
+        groups: DefaultDict[Tuple[str, str, str], List[Finding]] = defaultdict(list)
+        for f in deduped:
+            gkey = (f.file, f.rule_id, _normalize_msg_for_group(f.message))
+            groups[gkey].append(f)
+
+        merged: List[Finding] = []
+        for (_, _, _), group in groups.items():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+            group.sort(key=lambda x: (x.line, x.col))
+            head = group[0]
+            m = Finding(
+                file=head.file,
+                line=head.line,
+                col=head.col,
+                severity=head.severity,
+                rule_id=head.rule_id,
+                message=f"{head.message}  （合并 {len(group)} 条相似问题）",
+                snippet=head.snippet,
+                count=len(group),
+                examples=[f.line for f in group[: min(10, len(group))]]
+            )
+            merged.append(m)
+
+        return merged
+
 
 def summarize_findings(result: Dict[str, Any], top_k: int = 30) -> str:
     """生成摘要报告"""
@@ -849,25 +908,30 @@ def summarize_findings(result: Dict[str, Any], top_k: int = 30) -> str:
     external = result.get("external", {})
 
     if builtin:
-        lines.append(f"发现 {len(builtin)} 个静态问题：")
+        lines.append(f"发现 {len(builtin)} 个静态问题条目（已合并相似项）。")
         severity_count = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        total_count = 0
         for f in builtin:
-            sev = f.get("severity", "LOW")
+            sev = (f.get("severity") or "LOW").upper()
             severity_count[sev] = severity_count.get(sev, 0) + 1
+            total_count += int(f.get("count", 1))
 
-        lines.append(f"- 高危：{severity_count['HIGH']} 个")
-        lines.append(f"- 中危：{severity_count['MEDIUM']} 个")
-        lines.append(f"- 低危：{severity_count['LOW']} 个")
+        lines.append(f"- 高危：{severity_count['HIGH']} 个条目")
+        lines.append(f"- 中危：{severity_count['MEDIUM']} 个条目")
+        lines.append(f"- 低危：{severity_count['LOW']} 个条目")
+        lines.append(f"- 估算合并前总问题量：{total_count} 条")
 
         sorted_findings = sorted(builtin, key=lambda x: (
-            {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x.get("severity"), 9),
+            {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get((x.get("severity") or "LOW"), 9),
             x.get("file", ""),
             x.get("line", 0)
         ))
 
         lines.append(f"\n前 {min(top_k, len(sorted_findings))} 个问题：")
         for i, f in enumerate(sorted_findings[:top_k], 1):
-            lines.append(f"{i:02d}. [{f.get('severity', 'LOW')}] {f.get('rule_id', 'UNKNOWN')} "
+            cnt = int(f.get("count", 1))
+            cnt_tail = f" x{cnt}" if cnt > 1 else ""
+            lines.append(f"{i:02d}. [{f.get('severity', 'LOW')}] {f.get('rule_id', 'UNKNOWN')}{cnt_tail} "
                          f"{f.get('file', 'unknown')}:{f.get('line', 0)} - {f.get('message', '')}")
     else:
         lines.append("未发现静态问题。")
