@@ -95,6 +95,7 @@ class DropTextEdit(QTextEdit):
         self.parent_window = parent
         self.uploaded_files = []
         self._user_text = ""
+        self.source_folder = None  # 新增：记录源文件夹路径
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -216,6 +217,9 @@ class DropTextEdit(QTextEdit):
         """处理文件夹（递归读取所有“代码文件”）"""
         if not os.path.isdir(folder_path):
             return
+
+        # 保存源文件夹路径
+        self.source_folder = folder_path
 
         files_found = []
         allowed_extensions = CODE_FILE_EXTS
@@ -2091,6 +2095,28 @@ class EnhancedTabAI():
                                 f"已成功保存 {saved_count} 个文件到:\n{save_dir}"
                             )
 
+                            # ===== 新增：运行动态检测 =====
+                            run_dynamic = QMessageBox.question(
+                                self.ui,
+                                "运行动态检测",
+                                f"文件已保存成功。\n\n"
+                                f"是否对修复后的代码进行动态检测？\n\n"
+                                f"动态检测将实际执行代码并检测运行时问题。",
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.Yes
+                            )
+
+                            if run_dynamic == QMessageBox.Yes:
+                                # 获取源文件夹路径
+                                source_folder = None
+                                if hasattr(self.ui.input_edit, "source_folder"):
+                                    source_folder = self.ui.input_edit.source_folder
+                                elif hasattr(self.ui.input_edit_1, "source_folder"):
+                                    source_folder = self.ui.input_edit_1.source_folder
+
+                                self._run_dynamic_testing_on_fixed_files(fixed_files, source_folder)
+
+
                         except Exception as e:
                             self.ui.output_area.append(f"\n❌ 保存文件失败: {e}")
                             QMessageBox.critical(self.ui, "错误", f"保存文件失败:\n{str(e)}")
@@ -2195,6 +2221,166 @@ class EnhancedTabAI():
             f.write("\n".join(lines))
 
         return path
+
+    def _run_dynamic_testing_on_fixed_files(self, fixed_files: List[Dict], source_folder: str = None):
+        """
+        对修复后的文件进行动态检测
+        
+        Args:
+            fixed_files: 修复后的文件列表
+            source_folder: 源文件夹路径（如果有）
+        """
+        try:
+            from analyzers.llm_dynamic_tester import run_dynamic_tests
+            import tempfile
+            import shutil
+            
+            self.ui.output_area.append("\n" + "=" * 60)
+            self.ui.output_area.append("🔬 开始动态检测...")
+            self.ui.output_area.append("=" * 60)
+            
+            # 准备文件列表用于动态测试
+            test_files = []
+            
+            # 如果有源文件夹，需要复制整个文件夹并应用修复
+            if source_folder and os.path.isdir(source_folder):
+                self.ui.output_area.append(f"📁 源文件夹: {source_folder}")
+                
+                # 创建临时目录
+                temp_dir = tempfile.mkdtemp(prefix="dynamic_test_")
+                folder_name = os.path.basename(source_folder.rstrip(os.sep))
+                dest_folder = os.path.join(temp_dir, folder_name)
+                
+                try:
+                    # 复制整个文件夹
+                    shutil.copytree(source_folder, dest_folder,
+                                   ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.git',
+                                                                 'node_modules', 'venv', '.venv'))
+                    self.ui.output_area.append(f"✅ 已复制项目到临时目录")
+                    
+                    # 应用修复后的文件
+                    for fixed_file in fixed_files:
+                        file_path = fixed_file.get("file", "")
+                        content = fixed_file.get("content", "")
+                        original_content = fixed_file.get("original_content", "")
+                        
+                        if not file_path:
+                            continue
+                        
+                        # 计算相对路径
+                        if os.path.isabs(file_path):
+                            try:
+                                rel_path = os.path.relpath(file_path, source_folder)
+                            except ValueError:
+                                rel_path = os.path.basename(file_path)
+                        else:
+                            rel_path = file_path
+                        
+                        # 目标文件路径
+                        target_path = os.path.join(dest_folder, rel_path)
+                        
+                        # 写入修复后的内容
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        with open(target_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        
+                        # 添加到测试列表
+                        test_files.append({
+                            "file": target_path,
+                            "content": content,
+                            "original": original_content
+                        })
+                    
+                    self.ui.output_area.append(f"✅ 已应用 {len(test_files)} 个修复文件")
+                    
+                    # 运行动态测试
+                    self.ui.output_area.append("\n🧪 正在运行动态测试...")
+                    QApplication.processEvents()  # 更新UI
+                    
+                    report = run_dynamic_tests(test_files)
+                    
+                    # 显示结果
+                    self.ui.output_area.append("\n" + "=" * 60)
+                    self.ui.output_area.append("📊 动态检测报告")
+                    self.ui.output_area.append("=" * 60)
+                    
+                    if report.get("enabled"):
+                        total_tests = report.get("total_tests", 0)
+                        total_issues = report.get("total_issues", 0)
+                        passed = report.get("passed", 0)
+                        failed = report.get("failed", 0)
+                        
+                        self.ui.output_area.append(f"总测试数: {total_tests}")
+                        self.ui.output_area.append(f"通过: {passed} | 失败: {failed}")
+                        self.ui.output_area.append(f"\n发现问题总数: {total_issues}")
+                        
+                        if report.get("by_category"):
+                            self.ui.output_area.append("\n按类别统计:")
+                            for category, stats in report["by_category"].items():
+                                issues = stats.get("issues", 0)
+                                if issues > 0:
+                                    cat_name = {
+                                        "user_input": "用户输入",
+                                        "resource_management": "资源管理",
+                                        "concurrency": "并发",
+                                        "boundary_conditions": "边界条件",
+                                        "environment_config": "环境配置",
+                                        "dynamic_execution": "动态执行"
+                                    }.get(category, category)
+                                    self.ui.output_area.append(f"  • {cat_name}: {issues} 个")
+                        
+                        # 保存详细报告
+                        report_path = os.path.join(os.path.dirname(__file__), "..", "results",
+                                                   f"dynamic_test_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+                        
+                        import json
+                        with open(report_path, 'w', encoding='utf-8') as f:
+                            json.dump(report, f, ensure_ascii=False, indent=2)
+                        
+                        self.ui.output_area.append(f"\n📄 详细报告已保存: {report_path}")
+                    else:
+                        error = report.get("error", "未知错误")
+                        self.ui.output_area.append(f"❌ 动态测试未启用或失败: {error}")
+                    
+                finally:
+                    # 清理临时文件夹
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                        self.ui.output_area.append(f"\n🧹 已清理临时文件")
+            
+            else:
+                # 没有源文件夹，直接测试修复后的文件
+                self.ui.output_area.append("ℹ️ 未找到源文件夹，将直接测试修复后的文件")
+                
+                for fixed_file in fixed_files:
+                    content = fixed_file.get("content", "")
+                    original = fixed_file.get("original_content", "")
+                    filename = fixed_file.get("file", "unknown")
+                    
+                    test_files.append({
+                        "file": filename,
+                        "content": content,
+                        "original": original
+                    })
+                
+                if test_files:
+                    report = run_dynamic_tests(test_files)
+                    
+                    self.ui.output_area.append("\n📊 动态检测结果:")
+                    self.ui.output_area.append(f"发现问题: {report.get('total_issues', 0)} 个")
+            
+            self.ui.output_area.append("=" * 60)
+            self.ui.output_area.append("✅ 动态检测完成\n")
+            
+        except ImportError as e:
+            self.ui.output_area.append(f"\n⚠️ 动态测试模块未安装: {e}")
+            self.ui.output_area.append("请确保 analyzers/llm_dynamic_tester.py 存在")
+        except Exception as e:
+            self.ui.output_area.append(f"\n❌ 动态检测失败: {e}")
+            import traceback
+            traceback.print_exc()
+
 
     def _show_detailed_results(self, results: Dict[str, Any]):
         """显示详细的扫描和修复结果（辅助方法）"""

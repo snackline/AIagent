@@ -53,7 +53,7 @@ class FixResult:
 
 @dataclass
 class VerificationResult:
-    """验证结果数据结构（跨语言）"""
+    """验证结果数据结构（跨语言）+ 动态测试"""
     file: str
     language: str
     compile_success: bool
@@ -62,6 +62,7 @@ class VerificationResult:
     new_issues: List[Dict]
     fix_rate: float
     error_message: str = ""
+    dynamic_test_result: Optional[Dict[str, Any]] = None  # 新增：动态测试结果
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

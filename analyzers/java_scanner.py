@@ -262,12 +262,21 @@ class JavaScanner(BaseScanner):
             return "LOW"
 
     def scan_dynamic(self) -> Dict[str, Any]:
-        """动态检测：编译检查（支持 JUnit / EvoSuite classpath）"""
+        """动态检测：编译检查（支持 JUnit / EvoSuite classpath）+ 动态检测"""
         result = {
             "enabled": True,
             "compile_errors": [],
             "compile_success": False
         }
+        
+        # 添加新的动态检测
+        try:
+            from .dynamic_detector import JavaDynamicDetector
+            detector = JavaDynamicDetector(self.files)
+            dynamic_result = detector.detect_all()
+            result["dynamic_detection"] = dynamic_result
+        except Exception as e:
+            result["dynamic_detection_error"] = str(e)
 
         tmp_dir = tempfile.mkdtemp(prefix="java_compile_")
         try:
